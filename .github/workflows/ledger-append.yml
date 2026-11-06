@@ -1,0 +1,99 @@
+# .github/workflows/ledger-append.yml  (ALT-3 v2.8 = v2.7 4810f337 + checker v2.8 pin (D50 C2d M13: a recorded non-actor entry survives an outsider rename / ghost). AUTHOR / SYNTHETIC, NOT DEPLOYED)
+# Option P (default): this file lives on main of a SEPARATE repo `nokyuofficial/factory-ledger` that the Claude
+# GitHub App / GitHub connector is NOT installed on and cannot reach. The OWNER creates that repo and places this file.
+# The executor (Claude) can only post `LEDGER/1 ...` comments on issue LEDGER_ISSUE of nokyuofficial/factory-runner.
+# This workflow reads them with an OWNER-created, read-only, fine-grained token (secret LEDGER_READ_TOKEN: Issues read on
+# factory-runner only) and appends hash-chained entries to branch `ledger` of factory-ledger with its own GITHUB_TOKEN.
+# X-12 fixes: HIGH-1 (job guarded to refs/heads/main, checkout ref main, hard-coded sha256 of checker and config,
+# workflow_dispatch only by the OWNER login and only on main, no issue_comment/PR triggers, job-level concurrency);
+# HIGH-5 (cron catch-up every run re-reads every comment; but THE LEDGER IS NOT THE EXECUTOR'S STOP CHANNEL);
+# HIGH-6 (genesis only by the OWNER's workflow_dispatch run; ls-remote errors fail closed).
+# Structure follows factory-real-1.yml rev 4 (e0ce77d4): pinned checkout, no ${{ }} inside run:, fail closed.
+name: ledger-append
+on:
+  schedule:
+    - cron: '*/5 * * * *'          # best effort; GitHub may delay or skip scheduled runs
+  workflow_dispatch: {}            # step 7 (genesis) and manual catch-up, OWNER only (job guard below)
+permissions:
+  contents: write                  # push branch `ledger` of THIS repo only
+jobs:
+  append:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && github.actor == 'nokyuofficial'))
+    concurrency:
+      group: ledger-append
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      COMMENTS_REPO: nokyuofficial/factory-runner
+      LEDGER_ISSUE: '2'
+      CHECKER_SHA256: bc123ede83f15217421427f61373f93aa4ac0e6323c8de249b0be3a070eb2b5a
+      CONFIG_SHA256: a3ce2660bee89011ff51a32e1277c691b24190e16758d511fd5144c1b5beccde
+      RUN_ID: ${{ github.run_id }}.${{ github.run_attempt }}
+      EVENT_NAME: ${{ github.event_name }}
+      MAIN_SHA: ${{ github.sha }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with: { ref: main, persist-credentials: false, path: code }
+      - name: pins (checker and config must be exactly the reviewed bytes)
+        run: |
+          set -euo pipefail
+          [ "${RUN_ID##*.}" = 1 ] || { echo 're-run (attempt > 1): STOP'; exit 1; }
+          printf '%s  %s\n%s  %s\n' "$CHECKER_SHA256" code/bin/ledger_check.py "$CONFIG_SHA256" code/.github/ledger/config.json \
+            | sha256sum -c - || { echo 'checker/config sha mismatch: STOP'; exit 1; }
+          python3 -I - code/.github/ledger/config.json "$COMMENTS_REPO" "$LEDGER_ISSUE" <<'PY' || { echo 'config does not name the comments repo/issue: STOP'; exit 1; }
+          import json, sys
+          c = json.load(open(sys.argv[1]))
+          sys.exit(0 if c["repo"] == sys.argv[2] and str(c["issue_number"]) == sys.argv[3] else 1)
+          PY
+      - name: fetch ledger branch (absent -> only the OWNER's dispatch may write genesis; any other error -> STOP)
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          url="https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git"
+          git ls-remote --exit-code --heads "$url" ledger > /dev/null 2>&1; rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git clone -q --single-branch --branch ledger "$url" led || { echo 'clone failed: STOP'; exit 1; }
+          elif [ "$rc" -eq 2 ] && [ "$EVENT_NAME" = workflow_dispatch ]; then
+            git init -q -b ledger led && git -C led remote add origin "$url" || exit 1
+            echo 'ledger branch absent: this run writes genesis'
+          else
+            echo "ledger branch not readable (ls-remote rc=$rc, event=$EVENT_NAME): STOP"; exit 1
+          fi
+      - name: read all comments of the ledger issue (read-only token, paginated)
+        env:
+          GH_TOKEN: ${{ secrets.LEDGER_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || { echo 'LEDGER_READ_TOKEN missing: STOP'; exit 1; }
+          gh api --paginate "repos/${COMMENTS_REPO}/issues/${LEDGER_ISSUE}/comments?per_page=100" \
+            --jq '.[] | {id, created_at, updated_at, body, user: {login: .user.login, type: .user.type}}' > comments.jsonl
+          wc -l comments.jsonl
+      - name: append (checker refuses to write onto a ledger that does not verify)
+        run: |
+          set -euo pipefail
+          python3 -I code/bin/ledger_check.py append --ledger led/ledger.jsonl --comments comments.jsonl \
+            --config code/.github/ledger/config.json --run-id "$RUN_ID" --main-sha "$MAIN_SHA" \
+            --event-name "$EVENT_NAME" | tee append.json
+      - name: commit and push (fast-forward only; never --force)
+        run: |
+          set -euo pipefail
+          cd led
+          git add ledger.jsonl
+          if git diff --cached --quiet; then echo 'nothing new'; exit 0; fi
+          git -c user.name=factory-ledger-bot -c user.email=factory-ledger-bot@users.noreply.github.com \
+            commit -qm "ledger append run $RUN_ID"
+          git push origin HEAD:refs/heads/ledger || { echo 'push refused: the next scheduled run catches up'; exit 1; }
+          echo "ledger_commit=$(git rev-parse HEAD)"
+          sha256sum ledger.jsonl
+      - name: self-verify the pushed branch
+        run: |
+          set -euo pipefail
+          git -C led fetch -q origin ledger
+          python3 -I code/bin/ledger_check.py verify --repo led --ref FETCH_HEAD --config code/.github/ledger/config.json \
+            --comments comments.jsonl
